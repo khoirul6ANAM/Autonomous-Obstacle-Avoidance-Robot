@@ -1,0 +1,295 @@
+/* * --- SEQUENTIAL MISSION CODE ---
+ * Arduino UNO + HW-039 + Encoders + Hardcoded Slalom
+ */
+
+// --- KONFIGURASI DRIVING ---
+const int DRIVE_SPEED = 90;       
+const int TURN_SPEED = 40;        
+const int SLALOM_SPEED = 90;      
+const int SLALOM_TURN_SPEED = 80; 
+
+// --- KOMPENSASI INCLINE (TANJAKAN AWAL) ---
+const int INCLINE_ROTATIONS = 3;     
+const int INCLINE_LEFT_BOOST = 6;    
+
+// --- KONFIGURASI ENCODER & JARAK ---
+const unsigned long TICKS_PER_REV = 374;        
+const unsigned long TICKS_90_DEG = 190;         
+const unsigned long TICKS_45_DEG = 190; // Sesuai kalibrasi kode asli
+
+// JARAK LEG
+const unsigned long LEG1_ROTATIONS = 69;  // Sekitar 5 Meter
+const int LEG2_STOP_DIST = 40;            // Berhenti saat objek < 40cm
+
+// --- MOTOR TRIM ---
+const int LEFT_TRIM = 3;  
+const int RIGHT_TRIM = 5; 
+
+// --- DEFINISI PIN ---
+#define L_LPWM 9  
+#define L_RPWM 5  
+#define R_LPWM 6  
+#define R_RPWM 10 
+
+#define LEFT_ENC_PIN 2   
+#define LEFT_ENC_B_PIN A2 
+
+#define RIGHT_ENC_PIN 3  
+#define RIGHT_ENC_B_PIN A3 
+
+#define BUTTON_PIN 11
+
+#define C_TRIG 4   
+#define C_ECHO 8
+#define L_TRIG 7   
+#define L_ECHO 12
+#define R_TRIG A0
+#define R_ECHO A1
+
+// --- LOGIKA STATE MACHINE ---
+enum MissionState { IDLE, LEG_1, TURN_LEFT, LEG_2, SLALOM };
+MissionState currentState = IDLE;
+
+int slalomStep = 0;
+int distCenter = 0;
+
+volatile unsigned long leftCount = 0;
+volatile unsigned long rightCount = 0;
+
+// Debounce Tombol
+int buttonState;
+int lastButtonState = LOW;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+
+// --- INTERRUPTS ---
+void leftEncoderISR() { leftCount++; }
+void rightEncoderISR() { rightCount++; }
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(9600);
+  
+  // Inisialisasi Motor
+  pinMode(L_RPWM, OUTPUT); pinMode(L_LPWM, OUTPUT);
+  pinMode(R_RPWM, OUTPUT); pinMode(R_LPWM, OUTPUT);
+  
+  // Inisialisasi Encoder
+  pinMode(LEFT_ENC_PIN, INPUT_PULLUP);
+  pinMode(LEFT_ENC_B_PIN, INPUT_PULLUP); 
+  pinMode(RIGHT_ENC_PIN, INPUT_PULLUP);
+  pinMode(RIGHT_ENC_B_PIN, INPUT_PULLUP); 
+  
+  attachInterrupt(digitalPinToInterrupt(LEFT_ENC_PIN), leftEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_PIN), rightEncoderISR, RISING);
+  
+  // Inisialisasi Sensor & Button
+  pinMode(C_TRIG, OUTPUT); pinMode(C_ECHO, INPUT);
+  pinMode(L_TRIG, OUTPUT); pinMode(L_ECHO, INPUT);
+  pinMode(R_TRIG, OUTPUT); pinMode(R_ECHO, INPUT);
+  pinMode(BUTTON_PIN, INPUT);
+  
+  stopMotors();
+  delay(1000);
+  
+  Serial.println("--- MISSION READY (HARDCODED SLALOM) ---");
+  Serial.println("Tekan Tombol untuk Mulai.");
+}
+
+// --- LOOP UTAMA ---
+void loop() {
+  handleButton();
+  runMission();
+}
+
+void runMission() {
+  unsigned long target = 0;
+  unsigned long inclineLimit = 0;
+
+  switch (currentState) {
+    case IDLE:
+      stopMotors();
+      break;
+
+    case LEG_1:
+      target = LEG1_ROTATIONS * TICKS_PER_REV;
+      inclineLimit = INCLINE_ROTATIONS * TICKS_PER_REV;
+
+      if (leftCount < target && rightCount < target) {
+        if (leftCount < inclineLimit) {
+           drive(DRIVE_SPEED + INCLINE_LEFT_BOOST, DRIVE_SPEED); // Boost tanjakan
+        } else {
+           drive(DRIVE_SPEED, DRIVE_SPEED);
+        }
+      } else {
+        Serial.println("LEG 1 SELESAI.");
+        brakeMotors(); 
+        delay(500);
+        resetEncoders();
+        currentState = TURN_LEFT;
+      }
+      break;
+
+    case TURN_LEFT:
+      target = TICKS_90_DEG;
+      if (leftCount < target && rightCount < target) {
+        // Tank Turn ke Kiri (Manual Override)
+        analogWrite(L_RPWM, 0); digitalWrite(L_LPWM, LOW);
+        digitalWrite(L_RPWM, LOW); analogWrite(L_LPWM, TURN_SPEED); 
+        analogWrite(R_RPWM, TURN_SPEED); digitalWrite(R_LPWM, LOW);
+      } else {
+        Serial.println("BELOK SELESAI.");
+        brakeMotors();
+        delay(500);
+        currentState = LEG_2;
+      }
+      break;
+
+    case LEG_2:
+      distCenter = getDistance(C_TRIG, C_ECHO);
+      if (distCenter <= LEG2_STOP_DIST && distCenter > 0) {
+        Serial.println("OBJEK TERDETEKSI! Memulai Slalom...");
+        brakeMotors();
+        delay(1000);
+        resetEncoders();
+        slalomStep = 1;
+        currentState = SLALOM;
+      } else {
+        drive(DRIVE_SPEED, DRIVE_SPEED);
+      }
+      break;
+
+    case SLALOM:
+      runHardcodedSlalom();
+      break;
+  }
+}
+
+// --- LOGIKA SLALOM KAKU (HARDCODED) ---
+void runHardcodedSlalom() {
+  switch (slalomStep) {
+    case 1: // KANAN 45
+      if (turn(true, TICKS_45_DEG + 10)) slalomStep = 2;
+      break;
+    case 2: // MAJU 2
+      if (move(2 * TICKS_PER_REV)) slalomStep = 3;
+      break;
+    case 3: // KIRI 45
+      if (turn(false, TICKS_45_DEG + 10)) slalomStep = 4;
+      break;
+    case 4: // MAJU 2
+      if (move(2 * TICKS_PER_REV)) slalomStep = 5;
+      break;
+    case 5: // KIRI 45
+      if (turn(false, TICKS_45_DEG)) slalomStep = 6;
+      break;
+    case 6: // MAJU 3
+      if (move(3 * TICKS_PER_REV)) slalomStep = 7;
+      break;
+    case 7: // KANAN 45
+      if (turn(true, TICKS_45_DEG + 5)) slalomStep = 8;
+      break;
+    case 8: // MAJU 3
+      if (move(3 * TICKS_PER_REV)) slalomStep = 9;
+      break;
+    case 9: // KANAN 45
+      if (turn(true, TICKS_45_DEG + 20)) slalomStep = 10;
+      break;
+    case 10: // DASH FINISH (MAJU 15)
+      if (move(15 * TICKS_PER_REV)) {
+        Serial.println("MISI SELESAI!");
+        slalomStep = 99;
+        currentState = IDLE;
+      }
+      break;
+  }
+}
+
+// --- FUNGSI BANTU GERAK ---
+
+bool move(unsigned long target) {
+  if (leftCount < target && rightCount < target) {
+    drive(SLALOM_SPEED, SLALOM_SPEED);
+    return false; 
+  } else {
+    brakeMotors();
+    delay(500); 
+    resetEncoders();
+    return true; 
+  }
+}
+
+bool turn(bool right, unsigned long target) {
+  if (leftCount < target && rightCount < target) {
+    if (right) {
+      analogWrite(L_RPWM, SLALOM_TURN_SPEED); digitalWrite(L_LPWM, LOW);
+      digitalWrite(R_RPWM, LOW); analogWrite(R_LPWM, SLALOM_TURN_SPEED);
+    } else {
+      digitalWrite(L_RPWM, LOW); analogWrite(L_LPWM, SLALOM_TURN_SPEED);
+      analogWrite(R_RPWM, SLALOM_TURN_SPEED); digitalWrite(R_LPWM, LOW);
+    }
+    return false; 
+  } else {
+    brakeMotors();
+    delay(500);
+    resetEncoders();
+    return true; 
+  }
+}
+
+void drive(int lSpeed, int rSpeed) {
+  lSpeed = constrain(lSpeed + LEFT_TRIM, -255, 255);
+  rSpeed = constrain(rSpeed + RIGHT_TRIM, -255, 255);
+
+  if (lSpeed >= 0) { analogWrite(L_RPWM, lSpeed); digitalWrite(L_LPWM, LOW); }
+  else { digitalWrite(L_RPWM, LOW); analogWrite(L_LPWM, abs(lSpeed)); }
+  
+  if (rSpeed >= 0) { analogWrite(R_RPWM, rSpeed); digitalWrite(R_LPWM, LOW); }
+  else { digitalWrite(R_RPWM, LOW); analogWrite(R_LPWM, abs(rSpeed)); }
+}
+
+void brakeMotors() {
+  digitalWrite(L_RPWM, LOW); digitalWrite(L_LPWM, HIGH); 
+  digitalWrite(R_RPWM, LOW); digitalWrite(R_LPWM, HIGH); 
+  delay(50); 
+  stopMotors(); 
+}
+
+void stopMotors() {
+  digitalWrite(L_RPWM, LOW); digitalWrite(L_LPWM, LOW);
+  digitalWrite(R_RPWM, LOW); digitalWrite(R_LPWM, LOW);
+}
+
+void resetEncoders() { leftCount = 0; rightCount = 0; }
+
+int getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 15000); 
+  if (duration == 0) return 400; 
+  return duration / 58.2;
+}
+
+void handleButton() {
+  if (millis() < 2000) return;
+  int reading = digitalRead(BUTTON_PIN);
+  if (reading != lastButtonState) lastDebounceTime = millis();
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == HIGH) {
+        if (currentState == IDLE) {
+          Serial.println("--- MISSION START ---");
+          resetEncoders();
+          currentState = LEG_1;
+        } else {
+          Serial.println("--- MISSION RESET ---");
+          stopMotors();
+          currentState = IDLE;
+        }
+      }
+    }
+  }
+  lastButtonState = reading;
+}
